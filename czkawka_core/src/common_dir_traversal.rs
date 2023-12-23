@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::{DirEntry, FileType, Metadata, ReadDir};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use crate::common::{check_if_stop_received, prepare_thread_handler_common, send_
 use crate::common_directory::Directories;
 use crate::common_extensions::Extensions;
 use crate::common_items::ExcludedItems;
+use crate::common_tool::CommonToolData;
 use crate::common_traits::ResultEntry;
 use crate::flc;
 use crate::localizer_core::generate_translation_hashmap;
@@ -63,8 +64,6 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,
     pub modified_date: u64,
-    pub hash: String,
-    pub symlink_info: Option<SymlinkInfo>,
 }
 
 impl ResultEntry for FileEntry {
@@ -81,45 +80,14 @@ impl ResultEntry for FileEntry {
 
 // Symlinks
 
-const MAX_NUMBER_OF_SYMLINK_JUMPS: i32 = 20;
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct SymlinkInfo {
-    pub destination_path: PathBuf,
-    pub type_of_error: ErrorType,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Copy, Deserialize, Serialize)]
 pub enum ErrorType {
     InfiniteRecursion,
     NonExistentFile,
 }
 
-// Empty folders
-
-/// Enum with values which show if folder is empty.
-/// In function "`optimize_folders`" automatically "Maybe" is changed to "Yes", so it is not necessary to put it here
-#[derive(Eq, PartialEq, Copy, Clone, Debug)]
-pub(crate) enum FolderEmptiness {
-    No,
-    Maybe,
-}
-
-/// Struct assigned to each checked folder with parent path(used to ignore parent if children are not empty) and flag which shows if folder is empty
-#[derive(Clone, Debug)]
-pub struct FolderEntry {
-    pub path: PathBuf,
-    pub(crate) parent_path: Option<String>,
-    // Usable only when finding
-    pub(crate) is_empty: FolderEmptiness,
-    pub modified_date: u64,
-}
-
-// Collection mode (files / empty folders)
-
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum Collect {
-    EmptyFolders,
     InvalidSymlinks,
     Files,
 }
@@ -196,6 +164,18 @@ impl<'a, 'b> DirTraversalBuilder<'a, 'b, ()> {
 impl<'a, 'b, F> DirTraversalBuilder<'a, 'b, F> {
     pub fn root_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.root_dirs = dirs;
+        self
+    }
+
+    pub fn common_data(mut self, common_tool_data: &CommonToolData) -> Self {
+        self.root_dirs = common_tool_data.directories.included_directories.clone();
+        self.allowed_extensions = Some(common_tool_data.allowed_extensions.clone());
+        self.excluded_items = Some(common_tool_data.excluded_items.clone());
+        self.recursive_search = common_tool_data.recursive_search;
+        self.minimal_file_size = Some(common_tool_data.minimal_file_size);
+        self.maximal_file_size = Some(common_tool_data.maximal_file_size);
+        self.tool_type = common_tool_data.tool_type;
+        self.directories = Some(common_tool_data.directories.clone());
         self
     }
 
@@ -315,10 +295,6 @@ pub enum DirTraversalResult<T: Ord + PartialOrd> {
         warnings: Vec<String>,
         grouped_file_entries: BTreeMap<T, Vec<FileEntry>>,
     },
-    SuccessFolders {
-        warnings: Vec<String>,
-        folder_entries: HashMap<String, FolderEntry>, // Path, FolderEntry
-    },
     Stopped,
 }
 
@@ -345,22 +321,7 @@ where
 
         let mut all_warnings = vec![];
         let mut grouped_file_entries: BTreeMap<T, Vec<FileEntry>> = BTreeMap::new();
-        let mut folder_entries: HashMap<String, FolderEntry> = HashMap::new();
 
-        // Add root folders into result (only for empty folder collection)
-        if self.collect == Collect::EmptyFolders {
-            for dir in &self.root_dirs {
-                folder_entries.insert(
-                    dir.to_string_lossy().to_string(),
-                    FolderEntry {
-                        path: dir.clone(),
-                        parent_path: None,
-                        is_empty: FolderEmptiness::Maybe,
-                        modified_date: 0,
-                    },
-                );
-            }
-        }
         // Add root folders for finding
         let mut folders_to_check: Vec<PathBuf> = self.root_dirs.clone();
 
@@ -391,19 +352,14 @@ where
                     let mut dir_result = vec![];
                     let mut warnings = vec![];
                     let mut fe_result = vec![];
-                    let mut set_as_not_empty_folder_list = vec![];
-                    let mut folder_entries_list = vec![];
 
                     let Some(read_dir) = common_read_dir(&current_folder, &mut warnings) else {
-                        if collect == Collect::EmptyFolders {
-                            set_as_not_empty_folder_list.push(current_folder);
-                        }
-                        return (dir_result, warnings, fe_result, set_as_not_empty_folder_list, folder_entries_list);
+                        return (dir_result, warnings, fe_result);
                     };
 
                     let mut counter = 0;
                     // Check every sub folder/file/link etc.
-                    'dir: for entry in read_dir {
+                    for entry in read_dir {
                         let Some(entry_data) = common_get_entry_data(&entry, &mut warnings, &current_folder) else {
                             continue;
                         };
@@ -411,20 +367,7 @@ where
 
                         match (entry_type(file_type), collect) {
                             (EntryType::Dir, Collect::Files | Collect::InvalidSymlinks) => {
-                                process_dir_in_file_symlink_mode(recursive_search, &current_folder, entry_data, &directories, &mut dir_result, &mut warnings, &excluded_items);
-                            }
-                            (EntryType::Dir, Collect::EmptyFolders) => {
-                                counter += 1;
-                                process_dir_in_dir_mode(
-                                    &current_folder,
-                                    entry_data,
-                                    &directories,
-                                    &mut dir_result,
-                                    &mut warnings,
-                                    &excluded_items,
-                                    &mut set_as_not_empty_folder_list,
-                                    &mut folder_entries_list,
-                                );
+                                process_dir_in_file_symlink_mode(recursive_search, entry_data, &directories, &mut dir_result, &mut warnings, &excluded_items);
                             }
                             (EntryType::File, Collect::Files) => {
                                 counter += 1;
@@ -433,39 +376,18 @@ where
                                     &mut warnings,
                                     &mut fe_result,
                                     &allowed_extensions,
-                                    &current_folder,
                                     &directories,
                                     &excluded_items,
                                     minimal_file_size,
                                     maximal_file_size,
                                 );
                             }
-                            (EntryType::File | EntryType::Symlink, Collect::EmptyFolders) => {
-                                #[cfg(target_family = "unix")]
-                                if directories.exclude_other_filesystems() {
-                                    match directories.is_on_other_filesystems(&current_folder) {
-                                        Ok(true) => continue 'dir,
-                                        Err(e) => warnings.push(e.to_string()),
-                                        _ => (),
-                                    }
-                                }
-
-                                set_as_not_empty_folder_list.push(current_folder.clone());
-                            }
                             (EntryType::File, Collect::InvalidSymlinks) => {
                                 counter += 1;
                             }
                             (EntryType::Symlink, Collect::InvalidSymlinks) => {
                                 counter += 1;
-                                process_symlink_in_symlink_mode(
-                                    entry_data,
-                                    &mut warnings,
-                                    &mut fe_result,
-                                    &allowed_extensions,
-                                    &current_folder,
-                                    &directories,
-                                    &excluded_items,
-                                );
+                                process_symlink_in_symlink_mode(entry_data, &mut warnings, &mut fe_result, &allowed_extensions, &directories, &excluded_items);
                             }
                             (EntryType::Symlink, Collect::Files) | (EntryType::Other, _) => {
                                 // nothing to do
@@ -476,45 +398,31 @@ where
                         // Increase counter in batch, because usually it may be slow to add multiple times atomic value
                         atomic_counter.fetch_add(counter, Ordering::Relaxed);
                     }
-                    (dir_result, warnings, fe_result, set_as_not_empty_folder_list, folder_entries_list)
+                    (dir_result, warnings, fe_result)
                 })
                 .collect();
 
-            let required_size = segments.iter().map(|(segment, _, _, _, _)| segment.len()).sum::<usize>();
+            let required_size = segments.iter().map(|(segment, _, _)| segment.len()).sum::<usize>();
             folders_to_check = Vec::with_capacity(required_size);
 
             // Process collected data
-            for (segment, warnings, fe_result, set_as_not_empty_folder_list, fe_list) in segments {
+            for (segment, warnings, fe_result) in segments {
                 folders_to_check.extend(segment);
                 all_warnings.extend(warnings);
                 for fe in fe_result {
                     let key = (self.group_by)(&fe);
                     grouped_file_entries.entry(key).or_default().push(fe);
                 }
-                for current_folder in &set_as_not_empty_folder_list {
-                    set_as_not_empty_folder(&mut folder_entries, current_folder);
-                }
-                for (path, entry) in fe_list {
-                    folder_entries.insert(path.to_string_lossy().to_string(), entry);
-                }
             }
         }
 
         send_info_and_wait_for_ending_all_threads(&progress_thread_run, progress_thread_handle);
 
-        debug!(
-            "Collected {} files, {} folders",
-            grouped_file_entries.values().map(Vec::len).sum::<usize>(),
-            folder_entries.len()
-        );
+        debug!("Collected {} files", grouped_file_entries.values().map(Vec::len).sum::<usize>());
 
         match collect {
             Collect::Files | Collect::InvalidSymlinks => DirTraversalResult::SuccessFiles {
                 grouped_file_entries,
-                warnings: all_warnings,
-            },
-            Collect::EmptyFolders => DirTraversalResult::SuccessFolders {
-                folder_entries,
                 warnings: all_warnings,
             },
         }
@@ -526,7 +434,6 @@ fn process_file_in_file_mode(
     warnings: &mut Vec<String>,
     fe_result: &mut Vec<FileEntry>,
     allowed_extensions: &Extensions,
-    current_folder: &Path,
     directories: &Directories,
     excluded_items: &ExcludedItems,
     minimal_file_size: u64,
@@ -536,7 +443,7 @@ fn process_file_in_file_mode(
         return;
     }
 
-    let current_file_name = current_folder.join(entry_data.file_name());
+    let current_file_name = entry_data.path();
     if excluded_items.is_excluded(&current_file_name) {
         return;
     }
@@ -550,7 +457,7 @@ fn process_file_in_file_mode(
         }
     }
 
-    let Some(metadata) = common_get_metadata_dir(entry_data, warnings, current_folder) else {
+    let Some(metadata) = common_get_metadata_dir(entry_data, warnings, &current_file_name) else {
         return;
     };
 
@@ -560,59 +467,14 @@ fn process_file_in_file_mode(
             size: metadata.len(),
             modified_date: get_modified_time(&metadata, warnings, &current_file_name, false),
             path: current_file_name,
-            hash: String::new(),
-            symlink_info: None,
         };
 
         fe_result.push(fe);
     }
 }
 
-fn process_dir_in_dir_mode(
-    current_folder: &Path,
-    entry_data: &DirEntry,
-    directories: &Directories,
-    dir_result: &mut Vec<PathBuf>,
-    warnings: &mut Vec<String>,
-    excluded_items: &ExcludedItems,
-    set_as_not_empty_folder_list: &mut Vec<PathBuf>,
-    folder_entries_list: &mut Vec<(PathBuf, FolderEntry)>,
-) {
-    let next_folder = current_folder.join(entry_data.file_name());
-    if excluded_items.is_excluded(&next_folder) || directories.is_excluded(&next_folder) {
-        set_as_not_empty_folder_list.push(current_folder.to_path_buf());
-        return;
-    }
-
-    #[cfg(target_family = "unix")]
-    if directories.exclude_other_filesystems() {
-        match directories.is_on_other_filesystems(&next_folder) {
-            Ok(true) => return,
-            Err(e) => warnings.push(e),
-            _ => (),
-        }
-    }
-
-    let Some(metadata) = common_get_metadata_dir(entry_data, warnings, current_folder) else {
-        set_as_not_empty_folder_list.push(current_folder.to_path_buf());
-        return;
-    };
-
-    dir_result.push(next_folder.clone());
-    folder_entries_list.push((
-        next_folder.clone(),
-        FolderEntry {
-            path: next_folder,
-            parent_path: Some(current_folder.to_string_lossy().to_string()),
-            is_empty: FolderEmptiness::Maybe,
-            modified_date: get_modified_time(&metadata, warnings, current_folder, true),
-        },
-    ));
-}
-
 fn process_dir_in_file_symlink_mode(
     recursive_search: bool,
-    current_folder: &Path,
     entry_data: &DirEntry,
     directories: &Directories,
     dir_result: &mut Vec<PathBuf>,
@@ -623,25 +485,25 @@ fn process_dir_in_file_symlink_mode(
         return;
     }
 
-    let next_folder = current_folder.join(entry_data.file_name());
-    if directories.is_excluded(&next_folder) {
+    let dir_path = entry_data.path();
+    if directories.is_excluded(&dir_path) {
         return;
     }
 
-    if excluded_items.is_excluded(&next_folder) {
+    if excluded_items.is_excluded(&dir_path) {
         return;
     }
 
     #[cfg(target_family = "unix")]
     if directories.exclude_other_filesystems() {
-        match directories.is_on_other_filesystems(&next_folder) {
+        match directories.is_on_other_filesystems(&dir_path) {
             Ok(true) => return,
             Err(e) => warnings.push(e),
             _ => (),
         }
     }
 
-    dir_result.push(next_folder);
+    dir_result.push(dir_path);
 }
 
 fn process_symlink_in_symlink_mode(
@@ -649,7 +511,6 @@ fn process_symlink_in_symlink_mode(
     warnings: &mut Vec<String>,
     fe_result: &mut Vec<FileEntry>,
     allowed_extensions: &Extensions,
-    current_folder: &Path,
     directories: &Directories,
     excluded_items: &ExcludedItems,
 ) {
@@ -657,69 +518,31 @@ fn process_symlink_in_symlink_mode(
         return;
     }
 
-    let current_file_name = current_folder.join(entry_data.file_name());
+    let current_file_name = entry_data.path();
     if excluded_items.is_excluded(&current_file_name) {
         return;
     }
 
     #[cfg(target_family = "unix")]
     if directories.exclude_other_filesystems() {
-        match directories.is_on_other_filesystems(current_folder) {
+        match directories.is_on_other_filesystems(&current_file_name) {
             Ok(true) => return,
             Err(e) => warnings.push(e),
             _ => (),
         }
     }
 
-    let Some(metadata) = common_get_metadata_dir(entry_data, warnings, current_folder) else {
+    let Some(metadata) = common_get_metadata_dir(entry_data, warnings, &current_file_name) else {
         return;
     };
 
-    let mut destination_path = PathBuf::new();
-    let type_of_error;
-
-    match current_file_name.read_link() {
-        Ok(t) => {
-            destination_path.push(t);
-            let mut number_of_loop = 0;
-            let mut current_path = current_file_name.clone();
-            loop {
-                if number_of_loop == 0 && !current_path.exists() {
-                    type_of_error = ErrorType::NonExistentFile;
-                    break;
-                }
-                if number_of_loop == MAX_NUMBER_OF_SYMLINK_JUMPS {
-                    type_of_error = ErrorType::InfiniteRecursion;
-                    break;
-                }
-
-                current_path = match current_path.read_link() {
-                    Ok(t) => t,
-                    Err(_inspected) => {
-                        // Looks that some next symlinks are broken, but we do nothing with it - TODO why they are broken
-                        return;
-                    }
-                };
-
-                number_of_loop += 1;
-            }
-        }
-        Err(_inspected) => {
-            // Failed to load info about it
-            type_of_error = ErrorType::NonExistentFile;
-        }
-    }
-
     // Creating new file entry
     let fe: FileEntry = FileEntry {
+        size: metadata.len(),
         modified_date: get_modified_time(&metadata, warnings, &current_file_name, false),
         path: current_file_name,
-        size: 0,
-        hash: String::new(),
-        symlink_info: Some(SymlinkInfo { destination_path, type_of_error }),
     };
 
-    // Adding files to Vector
     fe_result.push(fe);
 }
 
@@ -808,38 +631,6 @@ pub fn get_modified_time(metadata: &Metadata, warnings: &mut Vec<String>, curren
                 warnings.push(flc!("core_file_no_modification_date", translation_hashmap));
             }
             0
-        }
-    }
-}
-
-pub fn get_lowercase_name(entry_data: &DirEntry, warnings: &mut Vec<String>) -> Option<String> {
-    let name = match entry_data.file_name().into_string() {
-        Ok(t) => t,
-        Err(_inspected) => {
-            warnings.push(flc!(
-                "core_file_not_utf8_name",
-                generate_translation_hashmap(vec![("name", entry_data.path().to_string_lossy().to_string())])
-            ));
-            return None;
-        }
-    }
-    .to_lowercase();
-    Some(name)
-}
-
-fn set_as_not_empty_folder(folder_entries: &mut HashMap<String, FolderEntry>, current_folder: &Path) {
-    let mut d = folder_entries.get_mut(current_folder.to_string_lossy().as_ref()).unwrap();
-    // Loop to recursively set as non empty this and all his parent folders
-    loop {
-        d.is_empty = FolderEmptiness::No;
-        if d.parent_path.is_some() {
-            let cf = d.parent_path.clone().unwrap();
-            d = folder_entries.get_mut(&cf).unwrap();
-            if d.is_empty == FolderEmptiness::No {
-                break; // Already set as non empty, so one of child already set it to non empty
-            }
-        } else {
-            break;
         }
     }
 }

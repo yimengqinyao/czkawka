@@ -2,7 +2,7 @@ use std::fs;
 use std::fs::DirEntry;
 use std::io::prelude::*;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::common::{check_folder_children, check_if_stop_received, prepare_thread_handler_common, send_info_and_wait_for_ending_all_threads};
-use crate::common_dir_traversal::{common_read_dir, get_lowercase_name, get_modified_time, CheckingMethod, ProgressData, ToolType};
+use crate::common_dir_traversal::{common_read_dir, get_modified_time, CheckingMethod, ProgressData, ToolType};
 use crate::common_tool::{CommonData, CommonToolData, DeleteMethod};
 use crate::common_traits::*;
 
@@ -106,14 +106,13 @@ impl Temporary {
                             check_folder_children(
                                 &mut dir_result,
                                 &mut warnings,
-                                &current_folder,
                                 &entry_data,
                                 self.common_data.recursive_search,
                                 &self.common_data.directories,
                                 &self.common_data.excluded_items,
                             );
                         } else if file_type.is_file() {
-                            if let Some(file_entry) = self.get_file_entry(&atomic_counter, &entry_data, &mut warnings, &current_folder) {
+                            if let Some(file_entry) = self.get_file_entry(&atomic_counter, &entry_data, &mut warnings) {
                                 fe_result.push(file_entry);
                             }
                         }
@@ -140,16 +139,18 @@ impl Temporary {
 
         true
     }
-    pub fn get_file_entry(&self, atomic_counter: &Arc<AtomicUsize>, entry_data: &DirEntry, warnings: &mut Vec<String>, current_folder: &Path) -> Option<FileEntry> {
+    pub fn get_file_entry(&self, atomic_counter: &Arc<AtomicUsize>, entry_data: &DirEntry, warnings: &mut Vec<String>) -> Option<FileEntry> {
         atomic_counter.fetch_add(1, Ordering::Relaxed);
 
-        let file_name_lowercase = get_lowercase_name(entry_data, warnings)?;
-
-        if !TEMP_EXTENSIONS.iter().any(|f| file_name_lowercase.ends_with(f)) {
+        let current_file_name = entry_data.path();
+        if self.common_data.excluded_items.is_excluded(&current_file_name) {
             return None;
         }
-        let current_file_name = current_folder.join(entry_data.file_name());
-        if self.common_data.excluded_items.is_excluded(&current_file_name) {
+
+        let file_name = entry_data.file_name();
+        let file_name_ascii_lowercase = file_name.to_ascii_lowercase();
+        let file_name_lowercase = file_name_ascii_lowercase.to_string_lossy();
+        if !TEMP_EXTENSIONS.iter().any(|f| file_name_lowercase.ends_with(f)) {
             return None;
         }
 
